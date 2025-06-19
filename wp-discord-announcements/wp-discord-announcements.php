@@ -30,9 +30,6 @@ class WP_Discord_Announcements {
         add_action('admin_init', array($this, 'register_settings'));
         add_action('transition_post_status', array($this, 'handle_post_status_change'), 10, 3);
         add_action('before_delete_post', array($this, 'handle_post_deletion'));
-        
-        // Activation hook
-        register_activation_hook(__FILE__, array($this, 'activate_plugin'));
     }
 
     public function activate_plugin() {
@@ -59,27 +56,38 @@ class WP_Discord_Announcements {
             'Discord Announcements Settings',
             'Discord Announcements',
             'manage_options',
-            'wp-discord-announcements',
-            array($this, 'settings_page')
+            'wp_discord_announcements',
+            array($this, 'render_settings_page')
         );
     }
 
     public function register_settings() {
-        register_setting('wp_discord_announcements', 'wp_discord_announcements_options');
-        
+        register_setting(
+            'wp_discord_announcements_options',
+            'wp_discord_announcements_options'
+        );
+
         add_settings_section(
-            'wp_discord_announcements_section',
+            'wp_discord_announcements_main',
             'Discord Webhook Settings',
             null,
-            'wp-discord-announcements'
+            'wp_discord_announcements'
         );
 
         add_settings_field(
             'webhook_url',
-            'Discord Webhook URL',
+            'Webhook URL',
             array($this, 'webhook_url_callback'),
-            'wp-discord-announcements',
-            'wp_discord_announcements_section'
+            'wp_discord_announcements',
+            'wp_discord_announcements_main'
+        );
+
+        add_settings_field(
+            'categories',
+            'Categories to Sync',
+            array($this, 'categories_callback'),
+            'wp_discord_announcements',
+            'wp_discord_announcements_main'
         );
     }
 
@@ -88,16 +96,44 @@ class WP_Discord_Announcements {
         echo '<input type="text" name="wp_discord_announcements_options[webhook_url]" value="' . esc_attr($webhook_url) . '" size="60" />';
     }
 
-    public function settings_page() {
+    public function categories_callback() {
+        $categories = get_categories(array('hide_empty' => false));
+        $selected_categories = isset($this->options['categories']) ? $this->options['categories'] : array('news');
+
+        echo '<select name="wp_discord_announcements_options[categories][]" multiple="multiple" style="min-width: 200px; min-height: 100px;">';
+        foreach ($categories as $category) {
+            $selected = in_array($category->slug, $selected_categories) ? 'selected="selected"' : '';
+            echo '<option value="' . esc_attr($category->slug) . '" ' . $selected . '>' . esc_html($category->name) . '</option>';
+        }
+        echo '</select>';
+        echo '<p class="description">Hold Ctrl/Cmd to select multiple categories</p>';
+    }
+
+    public function render_settings_page() {
+        if (isset($_POST['test_discord_webhook'])) {
+            $test_result = $this->test_discord_webhook();
+            if ($test_result === true) {
+                echo '<div class="notice notice-success"><p>Test message sent successfully!</p></div>';
+            } else {
+                echo '<div class="notice notice-error"><p>Error sending test message: ' . esc_html($test_result) . '</p></div>';
+            }
+        }
         ?>
         <div class="wrap">
             <h2>Discord Announcements Settings</h2>
-            <form action="options.php" method="post">
+            <form method="post" action="options.php">
                 <?php
-                settings_fields('wp_discord_announcements');
-                do_settings_sections('wp-discord-announcements');
+                settings_fields('wp_discord_announcements_options');
+                do_settings_sections('wp_discord_announcements');
                 submit_button();
                 ?>
+            </form>
+            
+            <hr />
+            <h3>Test Webhook Connection</h3>
+            <form method="post" action="">
+                <p>Click the button below to send a test message to Discord:</p>
+                <input type="submit" name="test_discord_webhook" class="button button-secondary" value="Send Test Message" />
             </form>
         </div>
         <?php
@@ -106,7 +142,14 @@ class WP_Discord_Announcements {
     public function handle_post_status_change($new_status, $old_status, $post) {
         // Only handle posts that are being published
         if ($new_status === 'publish' && $old_status !== 'publish') {
-            $this->send_to_discord($post);
+            $selected_categories = isset($this->options['categories']) ? $this->options['categories'] : array('news');
+            $post_categories = wp_get_post_categories($post->ID, array('fields' => 'slugs'));
+            
+            // Check if post is in any of the selected categories
+            $matching_categories = array_intersect($selected_categories, $post_categories);
+            if (!empty($matching_categories)) {
+                $this->send_to_discord($post);
+            }
         }
     }
 
@@ -128,46 +171,59 @@ class WP_Discord_Announcements {
         }
     }
 
+    public function handle_post_publish($post_id) {
+        error_log("Discord Announcements: Post published directly - ID: {$post_id}");
+        $post = get_post($post_id);
+        if ($post) {
+            $this->handle_post_status_change('publish', 'draft', $post);
+        }
+    }
+
     private function send_to_discord($post) {
         if (empty($this->webhook_url)) {
-            return;
+            return 'Webhook URL is not configured';
         }
 
         // Prepare the message
         $message = array(
-            'content' => '',
-            'embeds' => array(
-                array(
-                    'title' => $post->post_title,
-                    'description' => wp_trim_words($post->post_content, 100),
-                    'url' => get_permalink($post->ID),
-                    'color' => 7506394, // WordPress blue
-                    'timestamp' => (new DateTime($post->post_date_gmt))->format('c')
-                )
-            )
+            'content' => '@everyone A new announcement was posted, read it here! ' . get_permalink($post->ID)
         );
 
         // Send to Discord
         $response = wp_remote_post($this->webhook_url, array(
             'headers' => array('Content-Type' => 'application/json'),
             'body' => json_encode($message),
+            'timeout' => 15,
+            'sslverify' => true
         ));
 
-        if (!is_wp_error($response)) {
-            $discord_message_id = $this->extract_message_id($response);
-            if ($discord_message_id) {
-                global $wpdb;
-                // Store the mapping
-                $wpdb->replace(
-                    $this->table_name,
-                    array(
-                        'post_id' => $post->ID,
-                        'discord_message_id' => $discord_message_id
-                    ),
-                    array('%d', '%s')
-                );
+        if (is_wp_error($response)) {
+            return 'WordPress error: ' . $response->get_error_message();
+        }
+
+        $response_code = wp_remote_retrieve_response_code($response);
+        if ($response_code !== 204) {
+            return 'Discord API error: ' . wp_remote_retrieve_body($response);
+        }
+
+        $discord_message_id = $this->extract_message_id($response);
+        if ($discord_message_id) {
+            global $wpdb;
+            // Store the mapping
+            $result = $wpdb->replace(
+                $this->table_name,
+                array(
+                    'post_id' => $post->ID,
+                    'discord_message_id' => $discord_message_id
+                ),
+                array('%d', '%s')
+            );
+            if ($result === false) {
+                return 'Database error when storing message mapping';
             }
         }
+
+        return true;
     }
 
     private function delete_discord_message($message_id) {
@@ -189,6 +245,34 @@ class WP_Discord_Announcements {
                 'headers' => array('Content-Type' => 'application/json')
             ));
         }
+    }
+
+    public function test_discord_webhook() {
+        if (empty($this->webhook_url)) {
+            return 'Webhook URL is not configured';
+        }
+
+        $message = array(
+            'content' => 'Test message from WordPress - ' . date('Y-m-d H:i:s')
+        );
+
+        $response = wp_remote_post($this->webhook_url, array(
+            'headers' => array('Content-Type' => 'application/json'),
+            'body' => json_encode($message),
+            'timeout' => 15,
+            'sslverify' => true
+        ));
+
+        if (is_wp_error($response)) {
+            return 'WordPress error: ' . $response->get_error_message();
+        }
+
+        $response_code = wp_remote_retrieve_response_code($response);
+        if ($response_code !== 204) {
+            return 'Discord API error: ' . wp_remote_retrieve_body($response);
+        }
+
+        return true;
     }
 
     private function extract_message_id($response) {
