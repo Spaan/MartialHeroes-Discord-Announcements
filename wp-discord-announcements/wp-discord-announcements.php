@@ -3,7 +3,7 @@
  * Plugin Name: WP Discord Announcements
  * Description: Automatically syncs WordPress announcements to Discord
  * Version: 1.0.0
- * Author: Your Name
+ * Author: Spaan
  */
 
 // Prevent direct access to this file
